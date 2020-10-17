@@ -1,4 +1,7 @@
+import sys
+sys.path.append('..')
 import glob
+import argparse
 import numpy as np
 from skimage.util.shape import view_as_windows
 import matplotlib.pyplot as plt
@@ -10,121 +13,109 @@ import torch, cv2, h5py, math
 import torch.nn.functional as F
 from torchvision import transforms
 import cv2, os, glob, time
+from models.patch_based_cnn.model import PatchModel
+from dataloaders.PatchTopDataset import PatchTopDataset
+from tqdm import tqdm
+import pandas as pd
 
-from tqdm import tqdm #images done so far
+def load_model(args, im_size, gpus, channel_size=3, freeze_layer=True, resume_training=False):
+    model = PatchModel(im_size, channel_size)
+    try:
+        if torch.cuda.device_count() >= 1:
+            print(f"Let's use {torch.cuda.device_count()} GPUs!")
+            model = torch.nn.DataParallel(model, device_ids=gpus)
+        if int(args.resume_training)==1:
+            print("Loading Checkpoint..")
+            print(f"{args.output_dir}/patch_based_cnn/{args.dataset}/{args.protocol}/{args.protocol_type}/{im_size}/BEST.pth")
+            model.load_state_dict(torch.load(f"{args.output_dir}/patch_based_cnn/{args.dataset}/{args.protocol}/{args.protocol_type}/{im_size}/BEST.pth"))
+    except:
+        model = PatchModel(im_size, channel_size)
+        
+        if int(args.resume_training)==1:
+            print("Loading Checkpoint..")
+            print(f"{args.output_dir}/patch_based_cnn/{args.dataset}/{args.protocol}/{args.protocol_type}/{im_size}/BEST.pth")
+            model.load_state_dict(torch.load(f"{args.output_dir}/patch_based_cnn/{args.dataset}/{args.protocol}/{args.protocol_type}/{im_size}/BEST.pth"))
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1' 
+    if freeze_layer:
+        for param in model.parameters():
+            param.requires_grad = False
 
-# gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.30)
-# sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
-# K.set_session(sess)
-class PadSameConv(torch.nn.Module):
-    def __init__(self, in_size, out_size, kernel_size, stride, pad_size):
-        super(PadSameConv, self).__init__()
-        self.pad_size = pad_size
-        self.conv = torch.nn.Conv2d(in_size, out_size, kernel_size, stride)
+    model = model.cuda(gpus[0])
+    return model
 
-    def forward(self, x):
-        out = F.pad(x, (self.pad_size, self.pad_size, self.pad_size, self.pad_size), 'circular')
-        out = self.conv(out)
-        return out
+def get_arguments():
+    
+    parser = argparse.ArgumentParser(description='Define Training Details...')
+    parser.add_argument('--im_size', type=int, default=96)
+    parser.add_argument('--resume_training', type=int, default=1)
+    parser.add_argument('--gpu', type=str, default="0")
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--shuffle', type=bool, default=True)
+    parser.add_argument('--no_workers', type=int, default=6)
+    parser.add_argument('--lr', type=int, default=0.001)
+    parser.add_argument('--epoch', type=int, default=40)
+    parser.add_argument('--no_patch', type=int, default=15)
+    parser.add_argument('--channel_size', type=int, default=3)
+    parser.add_argument('--dataset', type=str, default='oulu')
+    parser.add_argument('--protocol', type=str, default='2')
+    parser.add_argument('--protocol_type', type=str, default='1')
+    parser.add_argument('--output_dir', type=str, default='../ckpts')
+    parser.add_argument('--csv_dir', type=str, default='../log')
+    parser.add_argument('--save_epoch_freq', type=int, default=2, help='frequency of saving checkpoints at the end of epochs')
+    parser.add_argument('--not_improved', type=int, default=10, help='break if consequtive not improve')
+    args = parser.parse_args()
+    
+    return args
+
+def balance_data_for_patch(DF,size=200, dtype="oulu"):
+    print("Balancing")
+    # separating Real
+    if dtype=="oulu":
+        REAL  = DF.loc[(DF['label'] == 1)]
+        SPOOF = DF.loc[(DF['label'] == 0)]
+    else:
+        REAL  = DF.loc[(DF['label'] == 0)]
+        SPOOF = DF.loc[(DF['label'] == 1)]
+    #shuffel
+    REAL = REAL.sample(frac=1).reset_index(drop=True)
+    REAL = REAL.iloc[0:size]
+    REAL = REAL.sort_values(by=['video_id'], ascending=True)
+    
+    SPOOF = SPOOF.sample(frac=1).reset_index(drop=True)
+    SPOOF = SPOOF.iloc[0:size]
+    SPOOF = SPOOF.sort_values(by=['video_id'], ascending=True)
+    
+    print(len(REAL),len(SPOOF))
+    return REAL,SPOOF
+
+def oulu(size=200):
+    root_path = f"/home/ec2-user/SageMaker/datasets/spoof_datasets/oulu/Dev/crop/"
+    REAL  = glob.glob(f"{root_path}/real/**/*")
+    SPOOF = glob.glob(f"{root_path}/spoof/**/*")
+    random.shuffle(REAL)
+    random.shuffle(SPOOF)
+    return REAL[:size], SPOOF[:size]
+
+def msu(protocol=2, proto_type=1):
+    csv_root_path = f"/home/ec2-user/SageMaker/hasan/access_paper/gaze-research/csvs/siw_protocol/protocol_{protocol}/protocol_{protocol}"
+    if protocol>1 and proto_type is not None:
+        csv_root_path = f"{csv_root_path}_type{proto_type}"
+    if protocol ==1 and proto_type is not None:
+        print(f"proto_type should be None for protocol 1")
+    elif protocol>1 and proto_type is None:
+        print(f"proto_type should not be none for protocol {protocol}")
+   
+    DEV_CSV   = pd.read_csv(f"{csv_root_path}_dev.csv",low_memory=False) 
+    print("DATASET INFORMATION: ")
+    print("MSU_SIW Protocol: ",protocol)
+    if proto_type is not None:
+        print("MSU_SIW Protocol Type: ",proto_type)
+    #SPOOF = DEV_CSV.loc[(DEV_CSV['label']==1)]
+    #REAL  = 
+    print(f"IMAGES: TEST IMAGES: {len(TEST_CSV)} \nDEV IMAGES: {len(DEV_CSV)}")
+    return {"train": TRAIN_CSV, "val": DEV_CSV,"test":TEST_CSV}
 
 
-class ChannelBasedLayer(torch.nn.Module):
-    def __init__(self, input_size, depth_size):
-        super(ChannelBasedLayer, self).__init__()
-        output_size = 150
-        step = 50
-        modules = []
-        cnt = depth_size // 50 - 2
-        for _ in range(cnt):
-            modules.append(PadSameConv(input_size, output_size, kernel_size=3, stride=1, pad_size=1))
-            modules.append(torch.nn.BatchNorm2d(output_size))
-            modules.append(torch.nn.MaxPool2d(2, 2))
-            modules.append(torch.nn.ReLU())
-            input_size += step
-            output_size += step
-
-        self.sequential = torch.nn.Sequential(*modules)
-
-    #         print(self.sequential)
-
-    def forward(self, x):
-        return self.sequential(x)
-
-
-class PatchModel(torch.nn.Module):
-    def __init__(self, im_size):
-        self.depth_size = self.get_depth_size(im_size)
-        super(PatchModel, self).__init__()
-
-        self.conv1 = torch.nn.Conv2d(3, 50, kernel_size=5, stride=1)
-        self.bn1 = torch.nn.BatchNorm2d(50)
-        self.maxpool1 = torch.nn.MaxPool2d(2, 2)
-
-        self.conv2 = torch.nn.Conv2d(50, 100, kernel_size=3, stride=1)
-        self.bn2 = torch.nn.BatchNorm2d(100)
-        self.maxpool2 = torch.nn.MaxPool2d(2, 2)
-
-        self.conv3 = ChannelBasedLayer(100, self.depth_size)
-
-        self.fc1 = torch.nn.Linear(self.depth_size * 3 * 3, 1000)
-        self.bn6 = torch.nn.BatchNorm1d(1000)
-        self.fc2 = torch.nn.Linear(1000, 400)
-        self.bn7 = torch.nn.BatchNorm1d(400)
-        self.fc3 = torch.nn.Linear(400, 2)
-
-        self.logsoft = torch.nn.LogSoftmax(dim=1)
-        self.relu = torch.nn.ReLU()
-
-    def get_depth_size(self, im_size):
-        depth_size = int(math.log(im_size // 3, 2)) * 50
-        return depth_size
-
-    def forward(self, x):
-        out = F.pad(x, (2, 2, 2, 2), 'circular')
-        out = self.bn1(self.conv1(out))
-        out = self.maxpool1(out)
-        out = self.relu(out)
-        ### 50 * 24 * 24 | 12 * 12
-
-        out = F.pad(out, (1, 1, 1, 1), 'circular')
-        out = self.maxpool2(self.bn2(self.conv2(out)))
-        out = self.relu(out)
-        ### 100 * 12 * 12 | 6 * 6
-
-        out = self.conv3(out)
-
-        ### 150 * 6 * 6 | 3 * 3
-
-        out = out.view(-1, self.depth_size * 3 * 3)
-
-        out = self.bn6(self.fc1(out))
-        out = self.relu(out)
-
-        out = self.bn7(self.fc2(out))
-        out = self.relu(out)
-
-        out = self.fc3(out)
-        out = self.logsoft(out)
-
-        return out
-im_size = 48
-step_size = 1
-length = int(((96 - im_size)/step_size) + 1)
-#model_path = f'../ckpts/patch_based_cnn/{im_size}/model_rgb.pth'
-model_path = f'../ckpts/patch_based_cnn/{im_size}/mobile_replay_model.pth'
-#data_path = "../../dataset/msu/dataset/Test/"
-#data_path = "../../dataset/spoof-data/msu/Test/"
-data_path = "../../dataset/spoof-data/mobile_replay/test"
-model = PatchModel(im_size)
-model = torch.nn.DataParallel(model, device_ids=[3, 4, 5, 6]) #[0, 1, 2, 3]
-model.load_state_dict(torch.load(model_path))
-model.cuda(3)
-spoof_path = data_path + "/spoof/"
-live_path = data_path + "/real/"
-transform = transforms.Compose([transforms.ToTensor()])
-n_samples = 50000
 
 
 def get_top_n(accuracy, n):
@@ -147,150 +138,6 @@ def get_top_n(accuracy, n):
         i += 1
 #     print(top_n_indices)
     return top_n_indices[:n]
-
-class PatchDataset(torch.utils.data.Dataset):
-    def __init__(self, path, transform=None, color_mode='rgb', im_size=48, patch_size=None, create_data=True, phase='train', datatype='msu'):
-        self.fnames = glob.glob(f"{path}/**/*.*", recursive=True)
-        self.fnames = list(np.random.choice(self.fnames, n_samples))
-        self.color_mode = color_mode
-        self.im_size = im_size
-        self.transform = transform
-        self.patch_size = patch_size
-        self.phase = phase
-        self.datatype = datatype
-#         if create_data:
-#             self.im_data, self.labels = self.create_data()
-#             self.save_data()
-#         else:
-#             self.im_data, self.labels = self.load_data()
-
-    def __getitem__(self, idx):
-#         im, label = self.im_data[idx], self.labels[idx]
-#         print(idx)
-        im, label = self.create_single_sample(idx)
-#         print(label)
-        return im, label
-
-    def __len__(self):
-        return len(self.fnames)
-    
-    def load_data(self):
-        hf = h5py.File(f'saved_data/10000_{self.phase}_{self.im_size}_sized_im_data.h5', 'r')
-        im_data = hf.get('im_data')
-        labels = hf.get('labels')
-        hf.close()
-        return im_data, labels
-    
-    def save_data(self):
-        hf = h5py.File(f'saved_data/{self.phase}_{self.im_size}_sized_im_data.h5', 'w')
-        hf.create_dataset('im_data', data=self.im_data)
-        hf.create_dataset('labels', data=self.labels)
-        hf.close()
-    
-    def create_single_sample(self, idx):
-        
-        im_path = self.fnames[idx]
-
-        label = self.fnames[idx].split("/")[-3]
-
-        img = cv2.imread(im_path)
-
-        img = cv2.cvtColor(img, eval(f'cv2.COLOR_BGR2{self.color_mode.upper()}'))
-#         patch_grid = self.divide_single_img_into_patches(img, patch_size=(96, 96, 3), step=1).reshape((-1, 96, 96, 3))
-            #         print(patch_grid.shape)
-        
-        imgs = self.get_batch_imgs(img, self.datatype)
-        if label == "spoof" in label or "device" in label or "print" in label or "video-replay" in label:
-            label = torch.ones(imgs.size(0))
-#             label = torch.tensor(1)
-        elif label == "live" or label == "real":
-            label = torch.zeros(imgs.size(0))
-#             label = torch.tensor(0)
-#         print(label)
-        return imgs, label
-
-    
-    def create_data(self):
-        start = time.time()
-        im_data = torch.zeros((1000, length*length, 3, self.im_size, self.im_size))
-        labels = torch.zeros(1000, length*length)
-        
-        for idx in range(len(self.fnames)):
-#             print(self.fnames[idx])
-            imgs, label = self.create_single_sample(idx)
-            im_data[idx] = imgs
-            labels[idx] = label
-            if idx % 100 == 0:
-#                 print(f"{idx+1} images are loaded so far!!")
-                print(f"It took {time.time() - start} to load!")
-            if (idx+1) % 1000 == 0:
-#                 print(idx+1)
-                break
-        return im_data, labels
-
-    def divide_single_img_into_patches(self, img, size=(224, 224), patch_size=(96, 96, 3), step=1):
-
-        img = cv2.resize(img, size)
-        #             print(img.shape, len(patch_size))
-        patch_grid = view_as_windows(img, patch_size, step)
-        #         print(patch_grid.shape)
-        return patch_grid
-
-    def get_calculated_patches(self, img_patch):
-        iterations = 6 - int(math.log((self.im_size // 3), 2))
-        total_imgs = sum([4 ** i for i in range(iterations)])
-        imgs = torch.zeros((total_imgs, 3, self.im_size, self.im_size))
-        step = 24
-        rows = 0
-        cols = 0
-        for i in range(iterations):
-            start = rows
-            end = cols
-            while end + self.im_size < 96:
-                while start + self.im_size < 96:
-                    im = img_patch[start:start + self.im_size, end:end + self.im_size, :]
-                    tensor = self.transform(im)
-                    imgs[i] = tensor
-                    start += self.im_size
-            end += self.im_size
-            start = 0
-
-    def get_random_patches(self, img_patch):
-        patch_96x96 = self.divide_single_img_into_patches(img_patch, size=(96, 96),
-                                                          patch_size=(self.im_size, self.im_size, 3)).reshape(
-            (-1, self.im_size, self.im_size, 3))
-#         random_20 = np.random.choice(np.arange(patch_96x96.shape[0]), 20)
-#         selected_imgs = patch_96x96[random_20]
-
-#         imgs = torch.zeros((20, 3, self.im_size, self.im_size))
-#         for idx in range(self.patch_size):
-#             imgs[idx] = self.transform(selected_imgs[idx])
-         
-        imgs = torch.zeros((patch_96x96.shape[0], 3, self.im_size, self.im_size))
-
-        for i in range(patch_96x96.shape[0]):
-            imgs[i] = self.transform(patch_96x96[i])
-# #             print(i)
-        return imgs
-    def get_oulu_patches(self, img_patch):
-        accuracy = np.load(f"patch_dicts/{self.im_size}/combined.npy")
-        top_indices = get_top_n(accuracy, 1)
-        imgs = torch.zeros((len(top_indices), 3, self.im_size, self.im_size))
-        for i in range(len(top_indices)):
-            imgs[i] = self.transform(img_patch[top_indices[i][0]:top_indices[i][0]+self.im_size, top_indices[i][1]:top_indices[i][1]+self.im_size,:])
-            
-        return imgs
-
-    def get_batch_imgs(self, im, datatype):
-        im = cv2.resize(im, (224, 224))
-        img_patch = im[66:66+96, 60:60+96, :]
-        if self.datatype == 'msu':
-            imgs = self.get_random_patches(img_patch)
-        else:
-            imgs = self.get_oulu_patches(img_patch)
-
-        return imgs
-
 
 
 def heatmap(data, row_labels, col_labels, ax=None, cbar_kw={}, cbarlabel="", **kwargs):
@@ -409,8 +256,8 @@ def count_correct_patches(dataloader, total_combined, correct_combined, spoof=Tr
 #         print(im.shape)
         imgs = im.reshape(-1, *size)
         label = label.reshape(-1)
-        imgs = imgs.cuda(3)
-        label = label.type(torch.LongTensor).cuda(3)
+        imgs = imgs.cuda(0)
+        label = label.type(torch.LongTensor).cuda(0)
 #         print(im.size(0))
 #         out = model(im)
         outputs = model(imgs)
@@ -528,8 +375,8 @@ def count_correct_patches(dataloader, total_combined, correct_combined, spoof=Tr
 
         imgs = im.reshape(-1, *size)
         label = label.reshape(-1)
-        imgs = imgs.cuda(3)
-        label = label.type(torch.LongTensor).cuda(3)
+        imgs = imgs.cuda(0)
+        label = label.type(torch.LongTensor).cuda(0)
 
         outputs = model(imgs)
         probs, preds = torch.max(outputs, 1)
@@ -676,13 +523,24 @@ def run_on_oulu(oulu_data_path, accuracy, number_of_patches=100):
     return correct_indices, top_k_accuracy, total_batch_corr, top_2_accuracy, any_patch_correct_accuracy, top_2_accuracy_with_prior 
 
 
-spoof_dataset = PatchDataset(spoof_path, transform=transform, color_mode='rgb', im_size=im_size, patch_size=None, create_data=True, phase='validation')
-live_dataset = PatchDataset(live_path, transform=transform, color_mode='rgb', im_size=im_size, patch_size=None, create_data=True, phase='validation')
+args    = get_arguments()
+im_size = args.im_size
+step_size = 1
+length = int(((96 - im_size)/step_size) + 1)
+gpus = args.gpu
+gpus = [int(x.strip()) for x in args.gpu.split(",")]
+print(gpus)
+model = load_model(args, im_size, gpus)
+transform = transforms.Compose([transforms.ToTensor()])
+n_samples = 400
+REAL,SPOOF = oulu(200)
+spoof_dataset = PatchTopDataset(SPOOF, transform=transform, color_mode='rgb', im_size=im_size, phase='test')
+live_dataset = PatchTopDataset(REAL, transform=transform, color_mode='rgb', im_size=im_size, phase='test')
 spoof_dataloader = torch.utils.data.DataLoader(
-    spoof_dataset, batch_size=1, shuffle=False, num_workers=64)
+    spoof_dataset, batch_size=1, shuffle=False, num_workers=8)
 
 live_dataloader = torch.utils.data.DataLoader(
-    live_dataset, batch_size=1, shuffle=False, num_workers=64)
+    live_dataset, batch_size=1, shuffle=False, num_workers=8)
 
 total_combined = 0
 correct_combined = 0
@@ -710,9 +568,10 @@ all_indices = np.add(np.array([*all_indices_spoof.values()]),
                      np.array([*all_indices_live.values()]))
 
 combined_accuracy = get_patch_accuracy(combined_correct, all_indices)
-np.save(f'patch_dicts/{im_size}/mobile_spoof.npy', spoof_accuracy)
-np.save(f'patch_dicts/{im_size}/mobile_combined.npy', combined_accuracy)
-np.save(f'patch_dicts/{im_size}/mobile_live.npy', live_accuracy)
+os.makedirs(f'patch_dicts/{im_size}')
+np.save(f'patch_dicts/{im_size}/OULU_spoof.npy', spoof_accuracy)
+np.save(f'patch_dicts/{im_size}/OULU_combined.npy', combined_accuracy)
+np.save(f'patch_dicts/{im_size}/OULU_live.npy', live_accuracy)
 
 # spoof_accuracy = np.load('patch_dicts/spoof.npy')
 # combined_accuracy = np.load('patch_dicts/combined.npy')
